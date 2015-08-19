@@ -1,5 +1,23 @@
 --[[
 
+Copyright 2014-2015 The Luvit Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS-IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--]]
+
+--[[
+
 Mid Level Storage Commands
 =========================
 
@@ -36,93 +54,22 @@ db.removeOwner(org, author)            - Remove an owner
 
 db.import(fs, path) -> kind, hash      - Import a file or tree into database
 db.export(hash, path) -> kind          - Export a hash to a path
+
 ]]
 
-return function (path)
-  local storage = require('./storage')(path)
+return function (rootPath)
   local semver = require('semver')
   local normalize = semver.normalize
-  local digest = require('openssl').digest.digest
-  local deflate = require('miniz').deflate
-  local inflate = require('miniz').inflate
-  local pathJoin = require('luvi').path.join
   local fs = require('coro-fs')
-  local git = require('git')
-  local decoders = git.decoders
-  local encoders = git.encoders
-  local deframe = git.deframe
-  local frame = git.frame
-  local modes = git.modes
-  local rules = require('rules')
-  local compileFilter = rules.compileFilter
-  local isAllowed = rules.isAllowed
-  local filterTree = rules.filterTree
+  local gitMount = require('git').mount
+  local import = require('import')
+  local export = require('export')
 
-  local db = {}
+  local db = gitMount(fs.chroot(rootPath))
+  local storage = db.storage
 
   local function assertHash(hash)
     assert(hash and #hash == 40 and hash:match("^%x+$"), "Invalid hash")
-  end
-
-  local function hashPath(hash)
-    return string.format("objects/%s/%s", hash:sub(1, 2), hash:sub(3))
-  end
-
-  function db.has(hash)
-    assertHash(hash)
-    return storage.read(hashPath(hash)) and true or false
-  end
-
-  function db.load(hash)
-    assertHash(hash)
-    local compressed, err = storage.read(hashPath(hash))
-    if not compressed then return nil, err end
-    return inflate(compressed, 1)
-  end
-
-  function db.loadAny(hash)
-    local raw = assert(db.load(hash), "no such hash")
-    local kind, value = deframe(raw)
-    return kind, decoders[kind](value)
-  end
-
-  function db.loadAs(kind, hash)
-    local actualKind, value = db.loadAny(hash)
-    assert(kind == actualKind, "Kind mismatch")
-    return value
-  end
-
-  function db.save(raw)
-    local hash = digest("sha1", raw)
-    -- 0x1000 = TDEFL_WRITE_ZLIB_HEADER
-    -- 4095 = Huffman+LZ (slowest/best compression)
-    storage.put(hashPath(hash), deflate(raw, 0x1000 + 4095))
-    return hash
-  end
-
-  function db.saveAs(kind, value)
-    if type(value) ~= "string" then
-      value = encoders[kind](value)
-    end
-    return db.save(frame(kind, value))
-  end
-
-  function db.hashes()
-    local groups = storage.nodes("objects")
-    local prefix, iter
-    return function ()
-      while true do
-        if prefix then
-          local rest = iter()
-          if rest then return prefix .. rest end
-          prefix = nil
-          iter = nil
-        end
-        prefix = groups()
-        if not prefix then return end
-        iter = storage.leaves("objects/" .. prefix)
-      end
-    end
   end
 
   function db.match(author, name, version)
@@ -133,26 +80,24 @@ return function (path)
 
   function db.read(author, name, version)
     version = normalize(version)
-    local path = string.format("refs/tags/%s/%s/v%s", author, name, version)
-    local hash = storage.read(path)
-    if not hash then return end
-    return hash:sub(1, 40)
+    local ref = string.format("refs/tags/%s/%s/v%s", author, name, version)
+    return db.getRef(ref)
   end
 
   function db.write(author, name, version, hash)
     version = normalize(version)
     assertHash(hash)
-    local path = string.format("refs/tags/%s/%s/v%s", author, name, version)
-    storage.write(path, hash .. "\n")
+    local ref = string.format("refs/tags/%s/%s/v%s", author, name, version)
+    storage.write(ref, hash .. "\n")
   end
 
   function db.authors()
-    return storage.nodes("refs/tags")
+    return db.nodes("refs/tags")
   end
 
   function db.names(author)
     local prefix = "refs/tags/" .. author .. "/"
-    local stack = {storage.nodes(prefix)}
+    local stack = {db.nodes(prefix)}
     return function ()
       while true do
         if #stack == 0 then return end
@@ -161,7 +106,7 @@ return function (path)
           local path = stack[#stack - 1]
           local newPath = path and path .. "/" .. name or name
           stack[#stack + 1] = newPath
-          stack[#stack + 1] = storage.nodes(prefix .. newPath)
+          stack[#stack + 1] = db.nodes(prefix .. newPath)
           return newPath
         end
         stack[#stack] = nil
@@ -171,8 +116,8 @@ return function (path)
   end
 
   function db.versions(author, name)
-    local path = string.format("refs/tags/%s/%s", author, name)
-    local iter = storage.leaves(path)
+    local ref = string.format("refs/tags/%s/%s", author, name)
+    local iter = db.leaves(ref)
     return function ()
       local item = iter()
       return item and item:sub(2)
@@ -249,110 +194,12 @@ return function (path)
   end
 
 
-  function db.import(fs, path, rules, nativeOnly)
-    if nativeOnly == nil then nativeOnly = false end
-    local filters = {}
-    if rules then
-      filters[#filters + 1] = compileFilter(path, rules, nativeOnly)
-    end
-
-    local importEntry, importTree
-
-    function importEntry(path, stat)
-      if stat.type == "directory" then
-        local hash = importTree(path)
-        if not hash then return end
-        return modes.tree, hash
-      end
-      if stat.type == "file" then
-        if not stat.mode then
-          stat = fs.stat(path)
-        end
-        local mode = bit.band(stat.mode, 73) > 0 and modes.exec or modes.file
-        return mode, db.saveAs("blob", assert(fs.readFile(path)))
-      end
-      if stat.type == "link" then
-        return modes.sym, db.saveAs("blob", assert(fs.readlink(path)))
-      end
-      error("Unsupported type at " .. path .. ": " .. tostring(stat.type))
-    end
-
-    function importTree(path)
-      assert(type(fs) == "table")
-
-      local items = {}
-      local meta = fs.readFile(pathJoin(path, "package.lua"))
-      if meta then meta = loadstring(meta)() end
-      if meta and meta.files then
-        filters[#filters + 1] = compileFilter(path, meta.files, nativeOnly)
-      end
-
-      for entry in assert(fs.scandir(path)) do
-        local fullPath = pathJoin(path, entry.name)
-        entry.type = entry.type or fs.stat(fullPath).type
-        if isAllowed(fullPath, entry, filters) then
-          entry.mode, entry.hash = importEntry(fullPath, entry)
-          if entry.hash then
-            items[#items + 1] = entry
-          end
-        end
-      end
-      return #items > 0 and db.saveAs("tree", items)
-    end
-
-    local mode, hash = importEntry(path, assert(fs.stat(path)))
-    if not hash then return end
-    return modes.toType(mode), hash
+  function db.import(fs, path) --> kind, hash
+    return import(db, fs, path)
   end
 
-  function db.export(hash, path, rules, nativeOnly)
-    if nativeOnly == nil then nativeOnly = true end
-    local kind, value = db.loadAny(hash)
-    if not kind then error(value or "No such hash") end
-
-    if kind == "tree" then
-      hash = filterTree(db, path, hash, rules, nativeOnly)
-      value = db.loadAs("tree", hash)
-    end
-
-    local exportEntry, exportTree
-
-    function exportEntry(path, mode, value)
-      if mode == modes.tree then
-        exportTree(path, value)
-      elseif mode == modes.sym then
-        local success, err = fs.symlink(value, path)
-        if not success and err:match("^ENOENT:") then
-          assert(fs.mkdirp(pathJoin(path, "..")))
-          assert(fs.symlink(value, path))
-        end
-      elseif modes.isFile(mode) then
-        local success, err = fs.writeFile(path, value)
-        if not success and err:match("^ENOENT:") then
-          assert(fs.mkdirp(pathJoin(path, "..")))
-          assert(fs.writeFile(path, value))
-        end
-        assert(fs.chmod(path, mode))
-      else
-        error("Unsupported mode at " .. path .. ": " .. mode)
-      end
-    end
-
-    function exportTree(path, tree)
-
-      assert(fs.mkdirp(path))
-      for i = 1, #tree do
-        local entry = tree[i]
-        local fullPath = pathJoin(path, entry.name)
-        local kind, value = db.loadAny(entry.hash)
-        assert(modes.toType(entry.mode) == kind, "Git kind mismatch")
-        exportEntry(fullPath, entry.mode, value)
-      end
-    end
-
-
-    exportEntry(path, kind == "tree" and modes.tree or modes.blob, value)
-    return kind
+  function db.export(hash, path) --> kind
+    return export(db, hash, fs, path)
   end
 
   return db

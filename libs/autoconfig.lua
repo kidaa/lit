@@ -1,8 +1,24 @@
-local log = require('./log')
+--[[
+
+Copyright 2014-2015 The Luvit Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS-IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--]]
+
+local log = require('log').log
 local fs = require('coro-fs')
 local env = require('env')
-local makeDb = require('db')
-local makeCore = require('core')
 
 local prefix
 if require('ffi').os == "Windows" then
@@ -47,34 +63,6 @@ if not config.defaultUpstream then
   dirty = true
 end
 
-local meta = require('../package')
-
-if config.upstream then
-  -- Only check for updates when online
-  local now = os.time()
-  -- Only check if we haven't checked for a while
-  -- TODO: only check if has internet.
-  if not config.checked or tonumber(config.checked) < now - 1000 then
-    config.checked = os.time()
-    dirty = true
-    log("checking for update", meta.version)
-    if not pcall(function ()
-      config.toupdate = require('auto-updater').check(meta)
-    end) then
-      log("no connection to update server", "lit.luvit.io")
-    end
-  end
-
-end
-if config.toupdate == meta.version then
-  config.toupdate = nil
-  dirty = true
-end
-
-if config.toupdate then
-  log("lit update available", config.toupdate, "highlight")
-end
-
 if not config.database then
   config.database = prefix .. "litdb.git"
   dirty = true
@@ -86,14 +74,4 @@ setmetatable(config, {
   __index = {save = save}
 })
 
-local privateKey
-local function getKey()
-  if not config.privateKey then return end
-  if privateKey then return privateKey end
-  local keyData = assert(fs.readFile(config.privateKey))
-  privateKey = require('openssl').pkey.read(keyData, true)
-  return privateKey
-end
-
-return makeCore(makeDb(config.database), config, getKey)
-
+return config

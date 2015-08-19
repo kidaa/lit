@@ -1,8 +1,5 @@
 exports.name = "creationix/websocket-codec"
-exports.version = "1.0.2-1"
-exports.dependencies = {
-  "creationix/hex-bin@1.0.0"
-}
+exports.version = "1.0.7"
 exports.homepage = "https://github.com/luvit/lit/blob/master/deps/websocket-codec.lua"
 exports.description = "A codec implementing websocket framing and helpers for handshakeing"
 exports.tags = {"http", "websocket", "codec"}
@@ -12,7 +9,6 @@ exports.author = { name = "Tim Caswell" }
 local digest = require('openssl').digest.digest
 local base64 = require('openssl').base64
 local random = require('openssl').random
-local hexToBin = require('hex-bin').hexToBin
 
 local band = bit.band
 local bor = bit.bor
@@ -73,10 +69,11 @@ function exports.decode(chunk)
   if mask then
     offset = offset + 4
   end
-  if #chunk < offset + len - 1 then return end
+  if #chunk < offset + len then return end
 
   local first = byte(chunk, 1)
   local payload = sub(chunk, offset + 1, offset + len)
+  assert(#payload == len, "Length mismatch")
   if mask then
     payload = applyMask(payload, sub(chunk, offset - 3, offset))
   end
@@ -120,7 +117,7 @@ function exports.encode(item)
     )),
     char(bor(
       mask and 0x80 or 0,
-      len < 0x10 and len or len < 0x10000 and 126 or 127
+      len < 126 and len or (len < 0x10000) and 126 or 127
     ))
   }
   if len >= 0x10000 then
@@ -132,7 +129,7 @@ function exports.encode(item)
     chars[8] = char(band(rshift(len, 16), 0xff))
     chars[9] = char(band(rshift(len, 8), 0xff))
     chars[10] = char(band(len, 0xff))
-  elseif len >= 0x10 then
+  elseif len >= 126 then
     chars[3] = char(band(rshift(len, 8), 0xff))
     chars[4] = char(band(len, 0xff))
   end
@@ -146,7 +143,7 @@ end
 local websocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 function exports.acceptKey(key)
-  return gsub(base64(hexToBin(digest("sha1", key .. websocketGuid))), "\n", "")
+  return gsub(base64(digest("sha1", key .. websocketGuid, true)), "\n", "")
 end
 local acceptKey = exports.acceptKey
 
@@ -161,8 +158,8 @@ function exports.handshake(options, request)
     path = path,
     {"Connection", "Upgrade"},
     {"Upgrade", "websocket"},
-    {"Sec-Websocket-Version", "13"},
-    {"Sec-Websocket-Key", key},
+    {"Sec-WebSocket-Version", "13"},
+    {"Sec-WebSocket-Key", key},
   }
   for i = 1, #options do
     req[#req + 1] = options[i]
@@ -171,7 +168,7 @@ function exports.handshake(options, request)
     req[#req + 1] = {"Host", host}
   end
   if protocol then
-    req[#req + 1] = {"Sec-Websocket-Protocol", protocol}
+    req[#req + 1] = {"Sec-WebSocket-Protocol", protocol}
   end
   local res = request(req)
   if not res then
@@ -202,7 +199,7 @@ end
 
 function exports.handleHandshake(head, protocol)
 
-  -- Websocket connections must be GET requests
+  -- WebSocket connections must be GET requests
   if not head.method == "GET" then return end
 
   -- Parse the headers for quick reading
@@ -213,7 +210,9 @@ function exports.handleHandshake(head, protocol)
   end
 
   -- Must have 'Upgrade: websocket' and 'Connection: Upgrade' headers
-  if not headers.connection or lower(headers.connection) ~= "upgrade" then return end
+  if not (headers.connection and headers.upgrade and
+          headers.connection:lower():find("upgrade", 1, true) and
+          headers.upgrade:lower():find("websocket", 1, true)) then return end
 
   -- Make sure it's a new client speaking v13 of the protocol
   if tonumber(headers["sec-websocket-version"]) < 13 then

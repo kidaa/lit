@@ -1,15 +1,36 @@
+--[[
+
+Copyright 2014-2015 The Luvit Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS-IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--]]
+
 local uv = require('uv')
 local semver = require('semver')
-local log = require('./log')
-local connect = require('coro-tcp').connect
+local log = require('log').log
+local netConnect = require('coro-net').connect
 local httpCodec = require('http-codec')
 local websocketCodec = require('websocket-codec')
-local makeRemote = require('./codec').makeRemote
+local makeRemote = require('codec').makeRemote
 local wrapper = require('coro-wrapper')
 local readWrap, writeWrap = wrapper.reader, wrapper.writer
 local tlsWrap = require('coro-tls').wrap
+local deframe = require('git').deframe
+local decodeTag = require('git').decoders.tag
+local verifySignature = require('verify-signature')
 
-local function connectRemote(url)
+local function connectRemote(url, timeout)
   local protocol, host, port, path = string.match(url, "^(wss?)://([^:/]+):?(%d*)(/?[^#]*)")
   local tls
   if protocol == "ws" then
@@ -23,7 +44,7 @@ local function connectRemote(url)
   end
   if #path == 0 then path = "/" end
 
-  local rawRead, rawWrite, socket = assert(connect(host, port))
+  local rawRead, rawWrite, socket = assert(netConnect({host=host, port=port}, timeout))
   if tls then
     rawRead, rawWrite = tlsWrap(rawRead, rawWrite)
   end
@@ -54,33 +75,33 @@ local function connectRemote(url)
   return socket, makeRemote(read, write, true)
 end
 
-return function(db, url)
+return function(db, url, timeout)
 
   -- Implement very basic connection keepalive using an uv_idle timer
   -- This will disconnect very quickly if a connect() isn't called
   -- soon after a disconnect()
-  local timeout, remote, socket
+  local keepalive, remote, socket
   local function connect()
     if remote then
-      timeout:stop()
+      keepalive:stop()
     else
       log("connecting", url)
-      socket, remote = connectRemote(url)
-      timeout = uv.new_timer()
+      socket, remote = connectRemote(url, timeout)
+      keepalive = uv.new_timer()
     end
   end
   local function close()
     if remote then
       -- log("disconnecting", url)
       socket:close()
-      timeout:close()
-      timeout = nil
+      keepalive:close()
+      keepalive = nil
       remote = nil
       socket = nil
     end
   end
   local function disconnect()
-    timeout:start(1000, 0, close)
+    keepalive:start(1000, 0, close)
   end
 
   function db.readRemote(author, name, version)
@@ -92,6 +113,8 @@ return function(db, url)
     disconnect()
     return data
   end
+
+  db.upstream = url
 
   db.offlineMatch = db.match
   function db.match(author, name, version)
@@ -136,12 +159,36 @@ return function(db, url)
         end
       end
       if #wants > 0 then
-        log("fetching", #wants .. " object" .. (#wants == 1 and "" or "s"))
         connect()
+        log("fetching", #wants .. " object" .. (#wants == 1 and "" or "s"))
         remote.writeAs("wants", wants)
         for i = 1, #wants do
           local hash = wants[i]
-          assert(db.save(remote.readAs("send")) == hash, "hash mismatch in result object")
+          local data = remote.readAs("send")
+          if data:sub(1, 3) == "tag" then
+            local kind, raw = deframe(data)
+            assert(kind == "tag")
+            local tag = decodeTag(raw)
+            if db.config.verifySignatures then
+              local owner = tag.tag:match("[^/]+")
+              local ok = verifySignature(db, owner, raw)
+              if ok then
+                log("importing", tag.tag, "highlight")
+              else
+                log("importing", tag.tag, "failure")
+              end
+            end
+          end
+          local actual = db.save(data)
+          if actual ~= hash then
+            p {
+              data = data,
+              wants = wants,
+              expected = hash,
+              actual = actual
+            }
+            error("Expected hash " .. hash .. " but got " .. actual .. " in result")
+          end
         end
         disconnect()
       end
@@ -155,8 +202,8 @@ return function(db, url)
           refs[value.tag] = hash
           table.insert(list, value.object)
         elseif kind == "tree" then
-          for i = 1, #value do
-            local subHash = value[i].hash
+          for j = 1, #value do
+            local subHash = value[j].hash
             table.insert(list, subHash)
           end
         end

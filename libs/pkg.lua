@@ -1,4 +1,22 @@
 --[[
+
+Copyright 2014-2015 The Luvit Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS-IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--]]
+
+--[[
 Package Metadata Commands
 ================
 
@@ -13,9 +31,11 @@ local isFile = require('git').modes.isFile
 local semver = require('semver')
 local pathJoin = require('luvi').path.join
 local listToMap = require('git').listToMap
+local jsonParse = require('json').parse
 
 local function evalModule(data, name)
-  local fn = assert(loadstring(data, name))
+  local fn, err = loadstring(data, name)
+  if not fn then return nil, err end
   local exports = {}
   local module = { exports = exports }
   setfenv(fn, {
@@ -44,34 +64,44 @@ local validKeys = {
   author = "table", -- person {name=name, email=email, url=url}
   contributors = "table", -- list of people
   dependencies = "table", -- list of strings
-  luvi = "table", -- {flavor=flavor,version=version}
+  luvi = "table", -- {flavor=flavor,version=version},
+  files = "table",
 }
 
 function exports.query(fs, path)
   local packagePath = path
   local stat, data, err
   stat, err = fs.stat(path)
+  local attempts = {}
   if stat then
     if stat.type == "directory" then
       packagePath = path .. "/"
-      data, err = fs.readFile(pathJoin(path, "package.lua"))
+      local fullPath = pathJoin(path, "package.lua")
+      attempts[#attempts + 1] = fullPath
+      data, err = fs.readFile(fullPath)
       if err and not err:match("^ENOENT:") then error(err) end
       if not data then
-        data, err = fs.readFile(pathJoin(path, "init.lua"))
+        fullPath = pathJoin(path, "init.lua")
+        attempts[#attempts + 1] = fullPath
+        data, err = fs.readFile(fullPath)
         if err and not err:match("^ENOENT:") then error(err) end
       end
     else
+      attempts[#attempts + 1] = packagePath
       data, err = fs.readFile(packagePath)
     end
   elseif err:match("^ENOENT:") then
     packagePath = packagePath .. ".lua"
+    attempts[#attempts + 1] = packagePath
     data, err = fs.readFile(packagePath)
   end
   if not data then
-    return data, err or "Can't find package at " .. path
+    local sep = "\n  Looked in: "
+    return data, "Can't find package at " .. path .. sep .. table.concat(attempts, sep)
   end
   local meta = evalModule(data, packagePath)
   local clean = {}
+  if not meta then return nil, "No meta found" end
   for key, value in pairs(meta) do
     if type(value) == validKeys[key] then
       clean[key] = value
@@ -83,7 +113,18 @@ end
 function exports.queryDb(db, hash)
   local kind, value = db.loadAny(hash)
   if kind == "tag" then
-    kind, value = db.loadAny(value.object)
+    hash = value.object
+
+    -- Use metata data in tag message if found
+    local meta = jsonParse(value.message)
+    if meta then
+      return meta, value.type, hash
+    end
+
+    local tagType = value.type
+    -- Otherwise search root tree or blob
+    kind, value = db.loadAny(hash)
+    assert(kind == tagType, "type mismatch")
   end
   local meta
   if kind == "tree" then
@@ -105,7 +146,7 @@ function exports.queryDb(db, hash)
   else
     error("Illegal kind: " .. kind)
   end
-  return meta, kind
+  return meta, kind, hash
 end
 
 function exports.normalize(meta)

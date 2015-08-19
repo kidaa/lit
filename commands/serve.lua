@@ -1,16 +1,17 @@
-local tcp = require('coro-tcp')
+local createServer = require('coro-net').createServer
 local uv = require('uv')
 local httpCodec = require('http-codec')
 local websocketCodec = require('websocket-codec')
 
-local log = require('log')
+local log = require('log').log
 local wrapper = require('coro-wrapper')
 local readWrap, writeWrap = wrapper.reader, wrapper.writer
 local makeRemote = require('codec').makeRemote
-local handlers = require('handlers')
-local handleRequest = require('api')(args[2])
+local core = require('core')()
+local handlers = require('handlers')(core)
+local handleRequest = require('api')(core.db, args[2])
 
-tcp.createServer("127.0.0.1", 4822, function (rawRead, rawWrite, socket)
+createServer(4822, function (rawRead, rawWrite, socket)
 
   -- Handle the websocket handshake at the HTTP level
   local read, updateDecoder = readWrap(rawRead, httpCodec.decoder())

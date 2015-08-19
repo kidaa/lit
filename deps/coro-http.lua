@@ -1,8 +1,8 @@
 exports.name = "creationix/coro-http"
-exports.version = "1.0.7-1"
+exports.version = "1.2.1-1"
 exports.dependencies = {
-  "creationix/coro-tcp@1.0.5",
-  "creationix/coro-tls@1.1.4",
+  "creationix/coro-net@1.1.1",
+  "creationix/coro-tls@1.2.1",
   "creationix/coro-wrapper@1.0.0",
   "luvit/http-codec@1.0.0"
 }
@@ -13,13 +13,14 @@ exports.license = "MIT"
 exports.author = { name = "Tim Caswell" }
 
 local httpCodec = require('http-codec')
-local connect = require('coro-tcp').connect
-local createServer = require('coro-tcp').createServer
+local net = require('coro-net')
+local connect = net.connect
+local createServer = net.createServer
 local tlsWrap = require('coro-tls').wrap
 local wrapper = require('coro-wrapper')
 
-function exports.createServer(addr, port, onConnect)
-  createServer(addr, port, function (rawRead, rawWrite, socket)
+function exports.createServer(host, port, onConnect)
+  createServer({host=host,port=port}, function (rawRead, rawWrite, socket)
     local read = wrapper.reader(rawRead, httpCodec.decoder())
     local write = wrapper.writer(rawWrite, httpCodec.encoder())
     for head in read do
@@ -65,22 +66,30 @@ local function getConnection(host, port, tls)
     if connection.host == host and connection.port == port and connection.tls == tls then
       table.remove(connections, i)
       -- Make sure the connection is still alive before reusing it.
-      if not connection.socket:is_closing() and connection.socket:is_active() then
+      if not connection.socket:is_closing() then
+        connection.reused = true
+        connection.socket:ref()
         return connection
       end
     end
   end
-  local read, write, socket = assert(connect(host, port))
+  local read, write, socket = assert(connect({host=host,port=port}))
   if tls then
     read, write = tlsWrap(read, write)
   end
+  local httpRead, updateRead = wrapper.reader(read, httpCodec.decoder())
   return {
     socket = socket,
     host = host,
     port = port,
     tls = tls,
-    read = wrapper.reader(read, httpCodec.decoder()),
+    read = httpRead,
     write = wrapper.writer(write, httpCodec.encoder()),
+    reset = function ()
+      -- This is called after parsing the response head from a HEAD request.
+      -- If you forget, the codec might hang waiting for a body that doesn't exist.
+      updateRead(httpCodec.decoder())
+    end
   }
 end
 exports.getConnection = getConnection
@@ -88,6 +97,7 @@ exports.getConnection = getConnection
 local function saveConnection(connection)
   if connection.socket:is_closing() then return end
   connections[#connections + 1] = connection
+  connection.socket:unref()
 end
 exports.saveConnection = saveConnection
 
@@ -118,7 +128,7 @@ function exports.request(method, url, headers, body)
   end
 
   if type(body) == "string" then
-    if not (contentLength and chunked) then
+    if not chunked and not contentLength then
       req[#req + 1] = {"Content-Length", #body}
     end
   end
@@ -126,12 +136,32 @@ function exports.request(method, url, headers, body)
   write(req)
   if body then write(body) end
   local res = read()
-  if not res then error("Connection closed") end
+  if not res then
+    write()
+    -- If we get an immediate close on a reused socket, try again with a new socket.
+    -- TODO: think about if this could resend requests with side effects and cause
+    -- them to double execute in the remote server.
+    if connection.reused then
+      return exports.request(method, url, headers, body)
+    end
+    error("Connection closed")
+  end
 
   body = {}
-  for item in read do
-    if #item == 0 then break end
-    body[#body + 1] = item
+  if req.method == "HEAD" then
+    connection.reset()
+  else
+    while true do
+      local item = read()
+      if not item then
+        res.keepAlive = false
+        break
+      end
+      if #item == 0 then
+        break
+      end
+      body[#body + 1] = item
+    end
   end
 
   if res.keepAlive then
@@ -141,7 +171,7 @@ function exports.request(method, url, headers, body)
   end
 
   -- Follow redirects
-  if method == "GET" and res.code == 302 then
+  if method == "GET" and (res.code == 302 or res.code == 307) then
     for i = 1, #res do
       local key, location = unpack(res[i])
       if key:lower() == "location" then

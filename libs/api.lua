@@ -1,4 +1,22 @@
 --[[
+
+Copyright 2014-2015 The Luvit Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS-IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--]]
+
+--[[
 REST API
 ========
 
@@ -45,6 +63,7 @@ GET /packages/$AUTHOR/$TAG/$VERSION -> tag json {
   }
   message = "..."
 }
+GET /packages/$AUTHOR/$TAG/$VERSION.zip -> zip bundle of app and dependencies
 
 GET /search/$query -> list of matches
 
@@ -55,10 +74,11 @@ local digest = require('openssl').digest.digest
 local date = require('os').date
 local jsonStringify = require('json').stringify
 local jsonParse = require('json').parse
-local core = require('./autocore')
-local db = core.db
 local modes = require('git').modes
-
+local exportZip = require('export-zip')
+local calculateDeps = require('calculate-deps')
+local queryDb = require('pkg').queryDb
+local installDeps = require('install-deps').toDb
 
 local litVersion = "Lit " .. require('../package').version
 
@@ -108,7 +128,7 @@ end
 
 local metaCache = {}
 
-return function (prefix)
+return function (db, prefix)
 
   local function makeUrl(kind, hash, filename)
     return prefix .. "/" .. kind .. "s/" .. hash .. '/' .. filename
@@ -117,21 +137,28 @@ return function (prefix)
   local function loadMeta(author, name, version)
     local hash
     if not version then
-      version, hash = db.match(author, name)
+      version, hash = (db.offlineMatch or db.match)(author, name)
     else
       hash = db.read(author, name, version)
+    end
+    if not hash then
+      error("No such version " .. author .. "/" .. name .. "@" .. version)
     end
     local cached = metaCache[hash]
     if cached then return cached end
     local tag = db.loadAs("tag", hash)
     local meta = tag.message:match("%b{}")
     meta = meta and jsonParse(meta) or {}
-    meta.url = prefix .. "/packages/" .. author .. "/" .. name .. "/v" .. version
     meta.version = version
     meta.hash = hash
     meta.tagger = tag.tagger
     meta.type = tag.type
     meta.object = tag.object
+    local filename = author .. "/" .. name .. "/v" .. version
+    if meta.type == "blob" then
+      filename = filename .. ".lua"
+    end
+    meta.url = makeUrl(meta.type, meta.object, filename)
     metaCache[hash] = meta
     return meta
   end
@@ -163,14 +190,34 @@ return function (prefix)
         search = prefix .. "/search/{query}",
       }
     end,
+    "^/packages/([^/]+)/(.+)/v([^/]+)%.zip$", function (author, name, version)
+
+      local meta, kind, hash = queryDb(db, db.read(author, name, version))
+
+      if kind ~= "tree" then
+        error("Can only create zips from trees")
+      end
+
+      -- Use snapshot if there is one
+      if meta.snapshot then
+        hash = meta.snapshot
+      else
+        local deps = {}
+        calculateDeps(db, deps, meta.dependencies)
+        hash = installDeps(db, hash, deps)
+      end
+
+      local zip = exportZip(db, hash)
+      local filename = meta.name:match("[^/]+$") .. "-v" .. meta.version .. ".zip"
+
+      return zip, {
+        {"Content-Type", "application/zip"},
+        {"Content-Disposition", "attachment; filename=" .. filename}
+      }
+    end,
     "^/packages/([^/]+)/(.+)/v([^/]+)$", function (author, name, version)
       local meta = loadMeta(author, name, version)
       meta.score = nil
-      local filename = author .. "/" .. name .. "-v" .. version
-      if meta.type == "blob" then
-        filename = filename .. ".lua"
-      end
-      meta.url = makeUrl(meta.type, meta.object, filename)
       return meta
     end,
     "^/packages/([^/]+)/(.+)$", function (author, name)
@@ -297,6 +344,7 @@ return function (prefix)
       local res = {
         query = query,
         matches = matches,
+        upstream = db.upstream,
       }
       return res
     end
@@ -332,7 +380,16 @@ return function (prefix)
       headers[key:lower()] = value
     end
     if not prefix then
-      prefix = "http://" .. headers.host
+      local host = headers.host
+      if host then
+        if host:match("localhost") then
+          prefix = "http://" .. host
+        else
+          prefix = "https://" .. host
+        end
+      else
+        prefix = ""
+      end
     end
     local body, extra
     for i = 1, #routes, 2 do

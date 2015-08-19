@@ -1,5 +1,22 @@
-local binToHex = require('hex-bin').binToHex
-local hexToBin = require('hex-bin').hexToBin
+--[[
+
+Copyright 2014-2015 The Luvit Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS-IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--]]
+
+local hex = require('openssl').hex
 local deflate = require('miniz').deflate
 local inflate = require('miniz').inflate
 
@@ -25,9 +42,17 @@ local function decodeBinary(message)
     local wants = {}
     for i = 1, byte(message, 2) do
       local start = i * 20 - 17
-      wants[i] = binToHex(sub(message, start, start + 19))
+      wants[i] = hex(sub(message, start, start + 19), true)
     end
     return "wants", wants
+  end
+  local inflated = inflate(message, 1)
+  if #inflated == 0 then
+    p {
+      message = message,
+      inflated = inflated,
+    }
+    error("Inflate error")
   end
   return "send", inflate(message, 1)
 end
@@ -41,7 +66,7 @@ function encoders.wants(hashes)
   assert(#hashes > 0, "Can't sent empty wants list")
   local data = {}
   for i = 1, #hashes do
-    data[i] = hexToBin(hashes[i])
+    data[i] = hex(hashes[i], false)
   end
   return {
     opcode = 2,

@@ -1,7 +1,26 @@
+--[[
+
+Copyright 2014-2015 The Luvit Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS-IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+--]]
+
 local ffi = require('ffi')
-local log = require('log')
+local log = require('log').log
 local pathJoin = require('luvi').path.join
 local modes = require('git').modes
+local colorize = require('pretty-print').colorize
 
 local quotepattern = '['..("%^$().[]*+-?"):gsub("(.)", "%%%1")..']'
 
@@ -37,8 +56,22 @@ function exports.compileFilter(path, rules, nativeOnly)
     }
   end
 
+  local default = not rules[1].allowed
+  if not rules.ignore then
+    local action, first
+    if default then
+      action = colorize("string", "includes")
+      first = colorize("thread", "negative")
+    else
+      action = colorize("thread", "excludes")
+      first = colorize("string", "positive")
+    end
+    log("compiling filter", string.format("%s %s by default (first rule is %s)",
+      pathJoin(path, "**"), action, first))
+  end
+
   return {
-    default = not rules[1].allowed,
+    default = default,
     prefix = "^" .. pathJoin(path:gsub(quotepattern, "%%%1"), '(.*)'),
     match = function (path)
       local allowed
@@ -57,16 +90,16 @@ local compileFilter = exports.compileFilter
 function exports.isAllowed(path, entry, filters)
 
   -- Ignore all hidden files and folders always.
-  local allow, subPath, default
+  local allow, matchesFilter, default, relativePath
   default = true
   for i = 1, #filters do
     local filter = filters[i]
-    local newPath = path:match(filter.prefix)
-    if newPath then
+    relativePath = path:match(filter.prefix)
+    if relativePath then
       default = filter.default
-      local newAllow = filter.match(newPath)
+      local newAllow = filter.match(relativePath)
       if newAllow ~= nil then
-        subPath = newPath
+        matchesFilter = true
         allow = newAllow
       end
     end
@@ -85,15 +118,15 @@ function exports.isAllowed(path, entry, filters)
     end
   end
 
-  if subPath then
+  if relativePath then
     if allow and not isTree then
-      log("including", subPath)
-    elseif not allow then
-      log("skipping", subPath)
+      log("including", relativePath)
+    elseif not allow and matchesFilter then
+      log("skipping", relativePath)
     end
   end
 
-  return allow, default, subPath
+  return allow, default, matchesFilter and relativePath
 end
 local isAllowed = exports.isAllowed
 
@@ -111,12 +144,12 @@ function exports.filterTree(db, path, hash, rules, nativeOnly) --> hash
       local entry = tree[i]
       if entry.name == "package.lua" then
         if modes.isFile(entry.mode) then
-          meta = db.loadAs("blob", entry.hash)
+          local lua = db.loadAs("blob", entry.hash)
+          meta = assert(loadstring(lua, pathJoin(path, "package.lua")))()
         end
         break
       end
     end
-    if meta then meta = loadstring(meta)() end
     if meta and meta.files then
       filters[#filters + 1] = compileFilter(path, meta.files, nativeOnly)
     end
